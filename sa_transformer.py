@@ -36,6 +36,7 @@ parser.add_argument('--save_ckpt_dir', type=str, default='checkpoints')
 parser.add_argument('--report_interval', type=int, default=5)
 parser.add_argument('--data_parallel', action='store_true', help='use data parallel?')
 parser.add_argument('--pred_method', type=str, choices=['mean', 'median'], default='mean')
+parser.add_argument('--cont', type=bool)
 opt = parser.parse_args()
 print(opt)
 
@@ -47,10 +48,9 @@ class TranDataset(Dataset):
     def __init__(self, features, labels, is_train=True):
         self.is_train = is_train
         self.data = []
-
         temp = []
         for feature, label in zip(features, labels):
-            feature = torch.from_numpy(feature).float()
+            feature = torch.from_numpy(np.array(feature)).float()
             duration, is_observed = label[0], label[1]
             temp.append([duration, is_observed, feature])
         sorted_temp = sorted(temp, key=itemgetter(0))
@@ -61,17 +61,21 @@ class TranDataset(Dataset):
             new_temp = temp
 
         for duration, is_observed, feature in new_temp:
+            if int(duration) > opt.max_time:
+                raise Exception("duration is ", int(duration))
             if is_observed:
                 mask = opt.max_time * [1.]
-                label = duration * [1.] + (opt.max_time - duration) * [0.]
+                label = int(duration) * [1.] + (opt.max_time - int(duration)) * [0.]
                 feature = torch.stack(opt.max_time * [feature])
-                self.data.append([feature.cuda(), torch.tensor(duration).float().cuda(), torch.tensor(mask).float().cuda(), torch.tensor(label).cuda(), torch.tensor(is_observed).byte().cuda()])
+                self.data.append([feature, torch.tensor(duration).float(), torch.tensor(mask).float(), torch.tensor(label), torch.tensor(is_observed).byte()])
+                #self.data.append([feature.cuda(), torch.tensor(duration).float().cuda(), torch.tensor(mask).float().cuda(), torch.tensor(label).cuda(), torch.tensor(is_observed).byte().cuda()])
             else:
                 # NOTE plus 1 to include day 0
-                mask = (duration + 1) * [1.] + (opt.max_time - (duration + 1)) * [0.]
+                mask = int(duration + 1) * [1.] + (opt.max_time - int(duration + 1)) * [0.]
                 label = opt.max_time * [1.]
                 feature = torch.stack(opt.max_time * [feature])
-                self.data.append([feature.cuda(), torch.tensor(duration).float().cuda(), torch.tensor(mask).float().cuda(), torch.tensor(label).cuda(), torch.tensor(is_observed).byte().cuda()])
+                self.data.append([feature, torch.tensor(duration).float(), torch.tensor(mask).float(), torch.tensor(label), torch.tensor(is_observed).byte()])
+                #self.data.append([feature.cuda(), torch.tensor(duration).float().cuda(), torch.tensor(mask).float().cuda(), torch.tensor(label).cuda(), torch.tensor(is_observed).byte().cuda()])
 
     def __getitem__(self, index_a):
         if self.is_train:
@@ -80,6 +84,8 @@ class TranDataset(Dataset):
             else:
                 # NOTE self.data is sorted
                 index_b = np.random.randint(index_a+1, len(self.data))
+            #print("AA", len(self.data[index_a]))
+            #print("AA", self.data[index_a][0][0])
             return [ [self.data[index_a][i], self.data[index_b][i]] for i in range(len(self.data[index_a])) ]
         else:
             return self.data[index_a]
@@ -216,6 +222,7 @@ class Encoder(nn.Module):
         self.final_layer = TranFinalLayer(d_model)
         
     def forward(self, x, mask=None):
+        #print(x.shape)
         x = self.position_encode(self.src_embed(x))
         for layer in self.layers:
             x = layer(x, mask)
@@ -245,7 +252,7 @@ def evaluate(encoder, test_loader):
 
         # NOTE batch size is 1
         for features, durations, mask, label, is_observed_single in test_loader:
-            is_observed.append(is_observed_single)
+            is_observed.append(is_observed_single[0])
             sigmoid_preds = encoder.forward(features)
             surv_probs = torch.cumprod(sigmoid_preds, dim=1).squeeze()
             total_surv_probs.append(surv_probs)
@@ -278,6 +285,7 @@ def evaluate(encoder, test_loader):
 
         pred_durations = np.asarray(pred_durations)
         true_durations = np.asarray(true_durations)
+        
         is_observed = np.asarray(is_observed, dtype=bool)
 
         print('pred durations OBS', pred_durations[is_observed].round())
@@ -319,7 +327,11 @@ def train(features, labels, encoder):
         encoder.train()
 
         tot_loss = 0.
+        n = 0
         for features, true_durations, mask, label, is_observed in train_loader:
+            if n%100 == 0:
+                print(n)
+            n = n+1
             optimizer.zero_grad()
 
             is_observed_a = is_observed[0]
@@ -330,8 +342,13 @@ def train(features, labels, encoder):
             true_durations_a = true_durations[0]
             true_durations_b = true_durations[1]
 
+            #print(features[0])
             sigmoid_a = encoder.forward(features[0])
             surv_probs_a = torch.cumprod(sigmoid_a, dim=1)
+            #print(sigmoid_a)
+            #print(surv_probs_a)
+            #print(mask_a)
+            #print(label_a) 
             loss = nn.BCELoss()(surv_probs_a * mask_a, label_a * mask_a)
 
             sigmoid_b = encoder.forward(features[1])
@@ -376,20 +393,108 @@ def train(features, labels, encoder):
 
 
 def main(features, labels, num_features):
+    print(opt.d_model)
     c = copy.deepcopy
     attn = MultiHeadedAttention(opt.num_heads, opt.d_model, opt.drop_prob)
     ff = PositionwiseFeedForward(opt.d_model, opt.d_ff, opt.drop_prob)
     encoder_layer = EncoderLayer(opt.d_model, c(attn), c(ff), opt.drop_prob)
-    encoder = Encoder(encoder_layer, opt.N, opt.d_model, opt.drop_prob, num_features).cuda()
+    encoder = Encoder(encoder_layer, opt.N, opt.d_model, opt.drop_prob, num_features)#.cuda()
     if opt.data_parallel:
-        encoder = torch.nn.DataParallel(encoder).cuda()
+        encoder = torch.nn.DataParallel(encoder)#.cuda()
+    if opt.cont:
+        datadir = opt.data_dir.replace('/', '.')
+        model_out_path = "{}/best_model_trainset_{}.pth".format(opt.save_ckpt_dir, datadir)
+        encoder = torch.load(model_out_path, weights_only=False)
     train(features, labels, encoder)
 
+
+def cat2num(df):
+    df['conditioning_intensity'] = df['conditioning_intensity'].map({
+    'NMA': 1, 
+    'RIC': 2,
+    'MAC': 3,
+    'TBD': None,
+    'No drugs reported': None,
+    'N/A, F(pre-TED) not submitted': None})
+    
+    df['tbi_status'] = df['tbi_status'].map({
+    'No TBI': 0, 
+    'TBI +- Other, <=cGy': 1,
+    'TBI +- Other, -cGy, fractionated': 2,
+    'TBI + Cy +- Other': 3,
+    'TBI +- Other, -cGy, single': 4,
+    'TBI +- Other, >cGy': 5,
+    'TBI +- Other, unknown dose': None})
+    
+    df['dri_score'] = df['dri_score'].map({
+    'Low': 1, 
+    'Intermediate': 2,
+    'Intermediate - TED AML case <missing cytogenetics': 3,
+    'High': 4,
+    'High - TED AML case <missing cytogenetics': 5,
+    'Very High': 6,
+    'N/A - pediatric': -3,
+    'N/A - non-malignant indication': -1,
+    'TBD cytogenetics': -2,
+    'N/A - disease not classifiable': -4,
+    'Missing disease status': 0})
+    
+    df['cyto_score'] = df['cyto_score'].map({
+    'Poor': 4,
+    'Normal': 3,
+    'Intermediate': 2,
+    'Favorable': 1,
+    'TBD': -1,
+    'Other': -2,
+    'Not tested': None})
+    
+    df['cyto_score_detail'] = df['cyto_score_detail'].map({
+    'Poor': 3, 
+    'Intermediate': 2,
+    'Favorable': 1,
+    'TBD': -1,
+    'Not tested': None})
+   
+    return df
+
 if __name__ == '__main__':
-    train_features = pd.read_csv(opt.data_dir + '/train_features.csv', header=0, index_col=False).to_numpy()
-    val_features = pd.read_csv(opt.data_dir + '/val_features.csv', header=0, index_col=False).to_numpy()
-    test_features = pd.read_csv(opt.data_dir + '/test_features.csv', header=0, index_col=False).to_numpy()
-    features = [train_features, val_features, test_features]
+    train_features = cat2num(pd.read_csv(opt.data_dir + '/train_features.csv', header=0, index_col=False))
+    val_features = cat2num(pd.read_csv(opt.data_dir + '/val_features.csv', header=0, index_col=False))
+    test_features = cat2num(pd.read_csv(opt.data_dir + '/test_features.csv', header=0, index_col=False))
+
+    RMV = ["ID","efs","efs_time","y"]
+    FEATURES = [c for c in train_features.columns if not c in RMV]
+    CATS = []
+    for c in FEATURES:
+        if train_features[c].dtype=="object":
+            CATS.append(c)
+            train_features[c] = train_features[c].fillna("NAN")
+            val_features[c] = val_features[c].fillna("NAN")
+            test_features[c] = test_features[c].fillna("NAN")
+
+    combined = pd.concat([train_features,val_features, test_features],axis=0,ignore_index=True)
+    for c in FEATURES:
+    
+        # LABEL ENCODE CATEGORICAL AND CONVERT TO INT32 CATEGORY
+        if c in CATS:
+            print(f"{c}, ", end="")
+            combined[c],_ = combined[c].factorize()
+            combined[c] -= combined[c].min()
+            combined[c] = combined[c].astype("int32")
+            combined[c] = combined[c].astype("category")
+        
+        # REDUCE PRECISION OF NUMERICAL TO 32BIT TO SAVE MEMORY
+        else:
+            if combined[c].dtype=="float64":
+                combined[c] = combined[c].astype("float32")
+            if combined[c].dtype=="int64":
+                combined[c] = combined[c].astype("int32")
+    combined = combined.ffill().bfill()
+
+    train_features = combined.iloc[:len(train_features)]
+    val_features = combined.iloc[len(train_features):len(train_features)+len(val_features)]
+    test_features = combined.iloc[len(train_features)+len(val_features):]
+    features = [train_features.to_numpy(), val_features.to_numpy(), test_features.to_numpy()]
 
     train_labels = pd.read_csv(opt.data_dir + '/train_labels.csv', header=0, index_col=False).to_numpy()
     val_labels = pd.read_csv(opt.data_dir + '/val_labels.csv', header=0, index_col=False).to_numpy()
