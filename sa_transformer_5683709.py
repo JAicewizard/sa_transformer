@@ -528,7 +528,7 @@ def calculate_hct_ci_score(row, mapping):
         return score
 
 def add_features(df):
-    df["hct_ci_score"] = df.apply(lambda row: calculate_hct_ci_score(row, hct_ci_mapping), axis=1)
+    #df["hct_ci_score"] = df.apply(lambda row: calculate_hct_ci_score(row, hct_ci_mapping), axis=1)
     #df['donor_recipient_age_diff'] = abs(df['donor_age'] - df['age_at_hct'])
     df = cat2num(df)
     df['hla_combined_low'] = df['hla_low_res_10']
@@ -546,7 +546,7 @@ if __name__ == '__main__':
     test_features = add_features(pd.read_csv(opt.data_dir + '/test_features.csv', header=0, index_col=False))
 
     combined = pd.concat([train_features,val_features, test_features],axis=0,ignore_index=True)
-    combined = combined.drop(columns=["ID", "vent_hist", "peptic_ulcer", "hla_low_res_10", "hepatic_severe", "hepatic_mild", "pulm_moderate", "pulm_severe"])
+    combined = combined.drop(columns=["ID", "vent_hist"])
     
     RMV = ["ID","efs","efs_time","y"]
     FEATURES = [c for c in combined.columns if not c in RMV]
